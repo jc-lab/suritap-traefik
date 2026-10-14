@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -77,7 +76,8 @@ func (v Verdict) ReasonString() string {
 // transport (StreamTransport); a natively compiled proxy may plug in the
 // shared-memory client instead.
 type Transport interface {
-	Open(src, dst Addr, meta []Meta) (Conn, error)
+	// Open announces a connection; ctx bounds waiting for Suricata.
+	Open(ctx context.Context, src, dst Addr, meta []Meta) (Conn, error)
 	Close() error
 }
 
@@ -104,6 +104,7 @@ const (
 	frameHeader    = 8
 	kOpen          = 1
 	kData          = 2
+	kGap           = 3
 	kClose         = 5
 	kVerdict       = 0x81
 	kPong          = 0x83
@@ -117,6 +118,28 @@ const (
 	defaultPayload = 64 * 1024
 )
 
+// Timing of the socket transport (variables for tests).
+var (
+	// dialTimeout bounds connecting and the HELLO/WELCOME exchange.
+	dialTimeout = 2 * time.Second
+	// retryDelay is how long a worker whose session could not be opened
+	// is reported unavailable before the next attempt.
+	retryDelay = time.Second
+	// writeStall bounds one frame write. Frames are never abandoned
+	// halfway (that would break the stream), so a request's verdict
+	// timeout applies between frames only; a server that takes longer
+	// than this to accept a frame is considered stuck and the session is
+	// torn down.
+	writeStall = 5 * time.Second
+	// stuckAfter: a session with abandoned verdict requests and no verdict
+	// at all for this long is considered stuck and torn down.
+	stuckAfter = 5 * time.Second
+	// idleTimeout closes sessions without traffic, so sessions of
+	// configurations Traefik no longer uses do not linger (plugins get no
+	// close callback); they are re-opened on demand.
+	idleTimeout = 5 * time.Minute
+)
+
 // StreamTransport talks to the suritap plugin over its socket transport
 // (worker-N.stream.sock). It uses only the Go standard library, so it runs
 // inside Traefik's Yaegi interpreter.
@@ -125,15 +148,23 @@ type StreamTransport struct {
 	name string
 
 	mu       sync.Mutex
-	sessions []*streamSession
+	sessions []*streamSession // per worker; nil until the worker count is known
+	dialing  []bool           // per worker: a session is being opened
+	probing  bool             // opening worker 0 to learn the worker count
+	layout   int              // incremented whenever sessions is replaced
 	retryAt  time.Time
 	nextCID  uint64
+	closed   bool
+	// Requests waiting for a session being opened. Woken (one value each,
+	// buffered) whenever an attempt ends; plain channels and
+	// context.AfterFunc instead of select, see streamSession.
+	waiters []chan struct{}
 }
 
 // NewStreamTransport creates a transport for the sockets in dir; sessions
 // are opened on first use and re-opened after failures.
 func NewStreamTransport(dir, name string) *StreamTransport {
-	return &StreamTransport{dir: dir, name: name, nextCID: uint64(time.Now().UnixNano())<<8 | 1}
+	return &StreamTransport{dir: dir, name: name, nextCID: uint64(time.Now().UnixNano()) << 8}
 }
 
 func streamPath(dir string, i int) string {
@@ -148,52 +179,115 @@ func mix(x uint64) uint64 {
 	return x ^ x>>33
 }
 
-// session returns the live session for the worker owning cid.
-func (t *StreamTransport) session(cid uint64) (*streamSession, error) {
+// session allocates a connection id and returns a live session for it.
+// Sessions are opened without holding t.mu, so a worker that does not
+// answer never blocks requests for the others; requests for a worker whose
+// session is being opened wait for it until ctx is done.
+func (t *StreamTransport) session(ctx context.Context) (uint64, *streamSession, error) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
-	if len(t.sessions) == 0 {
-		if time.Now().Before(t.retryAt) {
-			return nil, ErrUnavailable
+	t.nextCID++
+	cid := t.nextCID
+	var idx, layout int
+	for {
+		if t.closed {
+			t.mu.Unlock()
+			return cid, nil, ErrUnavailable
 		}
-		s, err := dialStream(streamPath(t.dir, 0), t.name)
-		if err != nil {
-			t.retryAt = time.Now().Add(time.Second)
-			return nil, err
+		idx = 0
+		busy := t.probing
+		if len(t.sessions) > 0 {
+			idx = int(mix(cid) % uint64(len(t.sessions)))
+			if s := t.sessions[idx]; s != nil && !s.isDead() {
+				t.mu.Unlock()
+				return cid, s, nil
+			}
+			busy = t.dialing[idx]
 		}
-		t.sessions = make([]*streamSession, s.workers)
-		t.sessions[0] = s
-	}
-	idx := int(mix(cid) % uint64(len(t.sessions)))
-	s := t.sessions[idx]
-	if s != nil && !s.isDead() {
-		return s, nil
+		if !busy {
+			break
+		}
+		ch := make(chan struct{}, 2)
+		t.waiters = append(t.waiters, ch)
+		t.mu.Unlock()
+		stop := context.AfterFunc(ctx, func() { ch <- struct{}{} })
+		<-ch
+		stop()
+		if ctx.Err() != nil {
+			return cid, nil, ErrUnavailable
+		}
+		t.mu.Lock()
 	}
 	if time.Now().Before(t.retryAt) {
-		return nil, ErrUnavailable
+		t.mu.Unlock()
+		return cid, nil, ErrUnavailable
 	}
+	if len(t.sessions) > 0 {
+		t.dialing[idx] = true
+	} else {
+		t.probing = true
+	}
+	layout = t.layout
+	t.mu.Unlock()
+
 	s, err := dialStream(streamPath(t.dir, idx), t.name)
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if layout == t.layout && idx < len(t.dialing) {
+		t.dialing[idx] = false
+	}
+	if t.sessions == nil {
+		t.probing = false
+	}
+	// Index loops: Yaegi mixes up the range operand with other locals of
+	// this function (reflect: call of Value.Len on int Value).
+	for i := 0; i < len(t.waiters); i++ {
+		t.waiters[i] <- struct{}{}
+	}
+	t.waiters = nil
 	if err != nil {
-		t.retryAt = time.Now().Add(time.Second)
-		if idx == 0 {
-			// Suricata may have restarted with another worker count.
-			t.sessions = nil
+		t.retryAt = time.Now().Add(retryDelay)
+		return cid, nil, err
+	}
+	if t.closed {
+		s.fail(errors.New("suritap: transport closed"))
+		return cid, nil, ErrUnavailable
+	}
+	if err := t.install(s); err != nil {
+		return cid, nil, err
+	}
+	// Any worker may take a new connection; idx only spreads the load.
+	return cid, s, nil
+}
+
+// install records a new session. A worker count different from the known
+// one means Suricata restarted with another configuration: the old
+// sessions are torn down and the layout is rebuilt. Called with t.mu held.
+func (t *StreamTransport) install(s *streamSession) error {
+	if s.workers != len(t.sessions) {
+		for i := 0; i < len(t.sessions); i++ {
+			if t.sessions[i] != nil {
+				t.sessions[i].fail(errors.New("suritap: worker layout changed"))
+			}
 		}
-		return nil, err
+		t.sessions = make([]*streamSession, s.workers)
+		t.dialing = make([]bool, s.workers)
+		t.layout++
 	}
-	if s.worker != idx || s.workers != len(t.sessions) {
-		s.fail(errors.New("suritap: worker layout changed"))
-		t.sessions = nil
-		return nil, ErrUnavailable
+	if s.worker >= len(t.sessions) {
+		s.fail(errors.New("suritap: bad worker index"))
+		return ErrUnavailable
 	}
-	t.sessions[idx] = s
-	return s, nil
+	if old := t.sessions[s.worker]; old != nil && old != s {
+		old.fail(errors.New("suritap: session replaced"))
+	}
+	t.sessions[s.worker] = s
+	return nil
 }
 
 // Open announces a new connection.
-func (t *StreamTransport) Open(src, dst Addr, meta []Meta) (Conn, error) {
-	cid := atomic.AddUint64(&t.nextCID, 1)
-	s, err := t.session(cid)
+func (t *StreamTransport) Open(ctx context.Context, src, dst Addr, meta []Meta) (Conn, error) {
+	cid, s, err := t.session(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -201,17 +295,20 @@ func (t *StreamTransport) Open(src, dst Addr, meta []Meta) (Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.write(time.Now().Add(2*time.Second), [][]byte{frameHead(kOpen, 0, len(body)), body}); err != nil {
+	if err := s.write(frameHead(kOpen, 0, len(body)), body); err != nil {
 		return nil, err
 	}
 	return &streamConn{s: s, cid: cid}, nil
 }
 
-// Close closes all sessions.
+// Close closes all sessions; the transport cannot be used afterwards.
 func (t *StreamTransport) Close() error {
 	t.mu.Lock()
 	sessions := t.sessions
 	t.sessions = nil
+	t.dialing = nil
+	t.closed = true
+	t.layout++
 	t.mu.Unlock()
 	for _, s := range sessions {
 		if s != nil {
@@ -232,22 +329,26 @@ type streamSession struct {
 	// Outstanding verdict requests live in fixed slots (token =
 	// generation<<10 | slot); the free list bounds them to the server's
 	// in-flight limit. A slot is released when its verdict arrives, also
-	// after the waiter timed out. Waiters receive the raw VERDICT body, nil
-	// when the session failed or an empty slice on timeout.
+	// after the waiter gave up (abandoned). Waiters receive the raw VERDICT
+	// body, nil when the session failed or an empty slice when cancelled.
 	//
 	// Written for Yaegi (v0.16): only compiled types are stored, since
-	// collections of channels of interpreted types crash it, and there is
-	// no select statement on concurrent paths, since all goroutines running
-	// one select statement share its case list.
-	pmu   sync.Mutex // guards slots, gens, free and dead
-	slots []chan []byte
-	gens  []uint32
-	free  []int
-	dead  bool
+	// collections of channels of interpreted types crash it; there is no
+	// select statement on concurrent paths, since all goroutines running
+	// one select statement share its case list; and no sync/atomic on
+	// fields.
+	pmu         sync.Mutex // guards everything below
+	slots       []chan []byte
+	gens        []uint32
+	free        []int
+	abandoned   int       // reserved slots whose waiter gave up
+	lastVerdict time.Time // last verdict received (or session start)
+	lastUse     time.Time // last frame written
+	dead        bool
 }
 
 func dialStream(path, name string) (*streamSession, error) {
-	c, err := net.DialTimeout("unix", path, 2*time.Second)
+	c, err := net.DialTimeout("unix", path, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("suritap: %v", err)
 	}
@@ -258,7 +359,7 @@ func dialStream(path, name string) (*streamSession, error) {
 	binary.LittleEndian.PutUint32(hello[8:], uint32(os.Getpid()))
 	binary.LittleEndian.PutUint32(hello[12:], 1) // socket transport
 	copy(hello[16:48], name)
-	_ = c.SetDeadline(time.Now().Add(2 * time.Second))
+	_ = c.SetDeadline(time.Now().Add(dialTimeout))
 	if _, err := c.Write(hello); err != nil {
 		c.Close()
 		return nil, fmt.Errorf("suritap: hello: %v", err)
@@ -284,14 +385,17 @@ func dialStream(path, name string) (*streamSession, error) {
 		c.Close()
 		return nil, fmt.Errorf("suritap: session refused (%d): %s", status, msg)
 	}
+	now := time.Now()
 	s := &streamSession{
-		conn:       c,
-		worker:     int(binary.LittleEndian.Uint16(w[8:])),
-		workers:    int(binary.LittleEndian.Uint16(w[10:])),
-		maxPayload: int(binary.LittleEndian.Uint32(w[12:])),
-		slots:      make([]chan []byte, maxInflight),
-		gens:       make([]uint32, maxInflight),
-		free:       make([]int, maxInflight),
+		conn:        c,
+		worker:      int(binary.LittleEndian.Uint16(w[8:])),
+		workers:     int(binary.LittleEndian.Uint16(w[10:])),
+		maxPayload:  int(binary.LittleEndian.Uint32(w[12:])),
+		slots:       make([]chan []byte, maxInflight),
+		gens:        make([]uint32, maxInflight),
+		free:        make([]int, maxInflight),
+		lastVerdict: now,
+		lastUse:     now,
 	}
 	if s.workers < 1 {
 		c.Close()
@@ -331,38 +435,60 @@ func (s *streamSession) fail(cause error) {
 		}
 	}
 	s.pmu.Unlock()
+	if cause != errIdle {
+		Logf(false, "session to worker %d closed: %v", s.worker, cause)
+	}
 	_ = s.conn.Close()
 	for i := 0; i < len(waiting); i++ {
 		waiting[i] <- nil
 	}
 }
 
+var (
+	errIdle  = errors.New("suritap: idle")
+	errStuck = errors.New("suritap: Suricata worker stopped answering")
+)
+
 // register reserves a slot for a verdict (false when the session failed or
-// too many verdicts are outstanding).
+// too many verdicts are outstanding). When the slots are used up mostly by
+// requests whose verdicts never came, the worker is stuck: the session is
+// torn down so that it gets re-opened.
 func (s *streamSession) register(ch chan []byte) (uint32, bool) {
 	s.pmu.Lock()
-	defer s.pmu.Unlock()
 	if s.dead || len(s.free) == 0 {
+		stuck := !s.dead && s.abandoned >= maxInflight/2
+		s.pmu.Unlock()
+		if stuck {
+			s.fail(errStuck)
+		}
 		return 0, false
 	}
 	idx := s.free[len(s.free)-1]
 	s.free = s.free[:len(s.free)-1]
 	s.gens[idx]++ // odd: reserved
 	s.slots[idx] = ch
-	return s.gens[idx]<<10 | uint32(idx), true
+	token := s.gens[idx]<<10 | uint32(idx)
+	s.pmu.Unlock()
+	return token, true
 }
 
 // take releases the slot of token once its verdict arrived (or the request
 // was never sent) and returns its waiter, nil when it gave up already.
-func (s *streamSession) take(token uint32) chan []byte {
+func (s *streamSession) take(token uint32, arrived bool) chan []byte {
 	idx := int(token & (maxInflight - 1))
 	s.pmu.Lock()
 	defer s.pmu.Unlock()
+	if arrived {
+		s.lastVerdict = time.Now()
+	}
 	if s.gens[idx]<<10|uint32(idx) != token || s.gens[idx]&1 == 0 {
 		return nil
 	}
 	s.gens[idx]++ // even: free
 	ch := s.slots[idx]
+	if ch == nil {
+		s.abandoned--
+	}
 	s.slots[idx] = nil
 	s.free = append(s.free, idx)
 	return ch
@@ -373,12 +499,33 @@ func (s *streamSession) take(token uint32) chan []byte {
 func (s *streamSession) abandon(token uint32) bool {
 	idx := int(token & (maxInflight - 1))
 	s.pmu.Lock()
-	defer s.pmu.Unlock()
 	if s.gens[idx]<<10|uint32(idx) != token || s.slots[idx] == nil {
+		s.pmu.Unlock()
 		return false
 	}
 	s.slots[idx] = nil
+	s.abandoned++
+	stuck := !s.dead && time.Since(s.lastVerdict) > stuckAfter
+	s.pmu.Unlock()
+	if stuck {
+		s.fail(errStuck)
+	}
 	return true
+}
+
+// idle reports a session without outstanding requests or writes for
+// idleTimeout; otherwise it returns when to check again.
+func (s *streamSession) idle() (bool, time.Time) {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	next := s.lastUse.Add(idleTimeout)
+	if len(s.free) != maxInflight || time.Now().Before(next) {
+		if !next.After(time.Now()) {
+			next = time.Now().Add(idleTimeout)
+		}
+		return false, next
+	}
+	return true, next
 }
 
 func (s *streamSession) readLoop() {
@@ -391,8 +538,18 @@ func (s *streamSession) readLoop() {
 	}()
 	r := bufio.NewReaderSize(s.conn, 64*1024)
 	head := make([]byte, frameHeader)
+	_ = s.conn.SetReadDeadline(time.Now().Add(idleTimeout))
 	for {
-		if _, err := io.ReadFull(r, head); err != nil {
+		if n, err := io.ReadFull(r, head); err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() && n == 0 {
+				idle, next := s.idle()
+				if idle {
+					s.fail(errIdle)
+					return
+				}
+				_ = s.conn.SetReadDeadline(next)
+				continue
+			}
 			s.fail(fmt.Errorf("suritap: session closed: %v", err))
 			return
 		}
@@ -421,31 +578,32 @@ func (s *streamSession) readLoop() {
 }
 
 func (s *streamSession) complete(token uint32, body []byte) {
-	if ch := s.take(token); ch != nil {
+	if ch := s.take(token, true); ch != nil {
 		ch <- body
 	}
 }
 
-// write sends whole frames. A write that fails or times out midway leaves
-// the stream unusable, so the session is torn down.
-func (s *streamSession) write(deadline time.Time, parts [][]byte) error {
-	if s.isDead() {
+// write sends one frame (writev, no copy). Frames are written whole: a
+// write that fails or stalls for writeStall leaves the stream unusable, so
+// the session is torn down.
+func (s *streamSession) write(parts ...[]byte) error {
+	now := time.Now()
+	s.wmu.Lock()
+	s.pmu.Lock()
+	dead := s.dead
+	s.lastUse = now
+	s.pmu.Unlock()
+	if dead {
+		s.wmu.Unlock()
 		return ErrUnavailable
 	}
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
-	_ = s.conn.SetWriteDeadline(deadline)
-	n := 0
-	for _, p := range parts {
-		n += len(p)
-	}
-	buf := make([]byte, 0, n)
-	for _, p := range parts {
-		buf = append(buf, p...)
-	}
-	if _, err := s.conn.Write(buf); err != nil {
+	_ = s.conn.SetWriteDeadline(now.Add(writeStall))
+	bufs := net.Buffers(parts)
+	_, err := bufs.WriteTo(s.conn)
+	s.wmu.Unlock()
+	if err != nil {
 		s.fail(fmt.Errorf("suritap: write: %v", err))
-		return err
+		return ErrUnavailable
 	}
 	return nil
 }
@@ -516,22 +674,30 @@ func decodeVerdict(body []byte) Verdict {
 	return v
 }
 
+// streamConn is one connection on a session. Each direction must be used
+// by one goroutine at a time; Close must not race with the others.
 type streamConn struct {
 	s      *streamSession
 	cid    uint64
-	closed int32
+	closed bool
 }
 
 func (c *streamConn) CID() uint64 { return c.cid }
 
-func (c *streamConn) sendChunks(deadline time.Time, dir Dir, data []byte) error {
+// sendChunks writes data as DATA frames. The deadline of ctx is checked
+// between frames: when it passed, the rest is reported as a gap so that the
+// engine stays aligned with the byte stream, and ctx's error is returned.
+func (c *streamConn) sendChunks(ctx context.Context, dir Dir, data []byte) error {
 	for len(data) > 0 {
+		if err := ctx.Err(); err != nil {
+			c.gap(dir, len(data))
+			return err
+		}
 		n := len(data)
 		if n > c.s.maxPayload {
 			n = c.s.maxPayload
 		}
-		hd := dataHead(c.cid, dir, 0)
-		if err := c.s.write(deadline, [][]byte{frameHead(kData, 0, dataFixed+n), hd, data[:n]}); err != nil {
+		if err := c.s.write(frameHead(kData, 0, dataFixed+n), dataHead(c.cid, dir, 0), data[:n]); err != nil {
 			return err
 		}
 		data = data[n:]
@@ -539,38 +705,46 @@ func (c *streamConn) sendChunks(deadline time.Time, dir Dir, data []byte) error 
 	return nil
 }
 
-// writeDeadline bounds socket writes made on behalf of ctx.
-func writeDeadline(ctx context.Context) time.Time {
-	if d, ok := ctx.Deadline(); ok {
-		return d
-	}
-	return time.Now().Add(2 * time.Second)
+// gap reports n bytes of dir that were not sent.
+func (c *streamConn) gap(dir Dir, n int) {
+	b := make([]byte, 16)
+	binary.LittleEndian.PutUint64(b, c.cid)
+	b[8] = byte(dir)
+	binary.LittleEndian.PutUint32(b[12:], uint32(n))
+	_ = c.s.write(frameHead(kGap, 0, len(b)), b)
 }
 
 func (c *streamConn) Send(ctx context.Context, dir Dir, data []byte) error {
-	return c.sendChunks(writeDeadline(ctx), dir, data)
+	return c.sendChunks(ctx, dir, data)
 }
 
 func (c *streamConn) Inspect(ctx context.Context, dir Dir, data []byte) (Verdict, error) {
-	deadline := writeDeadline(ctx)
 	split := 0
 	if len(data) > 0 {
 		split = (len(data) - 1) / c.s.maxPayload * c.s.maxPayload
 	}
-	if err := c.sendChunks(deadline, dir, data[:split]); err != nil {
+	if err := c.sendChunks(ctx, dir, data[:split]); err != nil {
 		return Verdict{}, err
 	}
 	last := data[split:]
-	// Room for the verdict (or nil on failure) and the timeout marker, so
-	// neither sender blocks.
+	if err := ctx.Err(); err != nil {
+		if len(last) > 0 {
+			c.gap(dir, len(last))
+		}
+		return Verdict{}, err
+	}
+	// Room for the verdict (or nil on failure) and the cancellation
+	// marker, so neither sender blocks.
 	ch := make(chan []byte, 2)
 	token, ok := c.s.register(ch)
 	if !ok {
+		if len(last) > 0 {
+			c.gap(dir, len(last))
+		}
 		return Verdict{}, ErrUnavailable
 	}
-	err := c.s.write(deadline, [][]byte{frameHead(kData, fWantVerdict, dataFixed+len(last)), dataHead(c.cid, dir, token), last})
-	if err != nil {
-		c.s.take(token)
+	if err := c.s.write(frameHead(kData, fWantVerdict, dataFixed+len(last)), dataHead(c.cid, dir, token), last); err != nil {
+		c.s.take(token, false)
 		return Verdict{}, err
 	}
 	// No select (see streamSession): cancellation posts a marker instead.
@@ -584,7 +758,7 @@ func (c *streamConn) Inspect(ctx context.Context, dir Dir, data []byte) (Verdict
 		if c.s.abandon(token) {
 			return Verdict{}, ctx.Err()
 		}
-		// The verdict (or failure) raced the timer and is queued.
+		// The verdict (or failure) raced the cancellation and is queued.
 		if body = <-ch; body == nil {
 			return Verdict{}, ErrUnavailable
 		}
@@ -593,13 +767,14 @@ func (c *streamConn) Inspect(ctx context.Context, dir Dir, data []byte) (Verdict
 }
 
 func (c *streamConn) Close(reset bool) error {
-	if !atomic.CompareAndSwapInt32(&c.closed, 0, 1) {
+	if c.closed {
 		return nil
 	}
+	c.closed = true
 	b := make([]byte, 16)
 	binary.LittleEndian.PutUint64(b, c.cid)
 	if reset {
 		b[8] = 1
 	}
-	return c.s.write(time.Now().Add(time.Second), [][]byte{frameHead(kClose, 0, len(b)), b})
+	return c.s.write(frameHead(kClose, 0, len(b)), b)
 }

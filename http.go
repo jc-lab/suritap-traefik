@@ -13,7 +13,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -34,6 +33,8 @@ func newHandler(next http.Handler, s settings, tr Transport) *handler {
 // open announces the request; src/dst of different or unknown families are
 // mapped onto the source family.
 func (t *handler) open(r *http.Request) (Conn, error) {
+	ctx, cancel := context.WithTimeout(r.Context(), t.s.timeout)
+	defer cancel()
 	src, ok := parseAddr(r.RemoteAddr)
 	if !ok {
 		return nil, errors.New("suritap: unusable client address")
@@ -47,7 +48,7 @@ func (t *handler) open(r *http.Request) (Conn, error) {
 		}
 	}
 	meta := append(requestMeta(r), Meta{Tag: MetaProxy, Value: "traefik"}, Meta{Tag: MetaEndpoint, Value: t.s.endpoint})
-	return t.tr.Open(src, dst, meta)
+	return t.tr.Open(ctx, src, dst, meta)
 }
 
 func (t *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -83,20 +84,39 @@ func (t *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rw.finish()
 }
 
-// reqState is shared by the request body reader and the response writer.
+// reqState is shared by the request body reader (run by the upstream
+// transport's goroutine) and the response writer. A mutex rather than
+// sync/atomic: Yaegi crashes on atomics on fields used across goroutines.
 type reqState struct {
-	blocked int32 // set when a streamed request body was blocked: 1 drop, 2 no verdict
+	mu      sync.Mutex
+	blocked int // set when a streamed request body was blocked: 1 drop, 2 no verdict
 }
 
-func (st *reqState) isBlocked() bool { return atomic.LoadInt32(&st.blocked) != 0 }
-func (st *reqState) isDrop() bool    { return atomic.LoadInt32(&st.blocked) == 1 }
+// No defer and no helper calls on these hot paths: interpreted calls are
+// costly under Yaegi.
+
+func (st *reqState) isBlocked() bool {
+	st.mu.Lock()
+	b := st.blocked != 0
+	st.mu.Unlock()
+	return b
+}
+
+func (st *reqState) isDrop() bool {
+	st.mu.Lock()
+	d := st.blocked == 1
+	st.mu.Unlock()
+	return d
+}
 
 func (st *reqState) block(v *Verdict) {
+	b := 2
 	if isDrop(v) {
-		atomic.StoreInt32(&st.blocked, 1)
-	} else {
-		atomic.StoreInt32(&st.blocked, 2)
+		b = 1
 	}
+	st.mu.Lock()
+	st.blocked = b
+	st.mu.Unlock()
 }
 
 func parseAddr(s string) (Addr, bool) {
@@ -288,8 +308,9 @@ func (b *inspectBody) Close() error { return b.body.Close() }
 // respWriter forwards the response and inspects it. Detect mode streams it
 // to Suricata without waiting. Prevent mode buffers responses up to
 // maxResponseBuffer and inspects them complete (a blocked response becomes
-// a 403); larger responses are inspected while streaming and the
-// connection is aborted when later bytes are dropped.
+// a 403); larger responses, and responses the handler flushes (event
+// streams, long polling), are inspected while streaming and the connection
+// is aborted when later bytes are dropped.
 type respWriter struct {
 	http.ResponseWriter
 	t    *handler
@@ -433,17 +454,21 @@ func (w *respWriter) Flush() {
 	if w.aborted {
 		return
 	}
-	if !w.committed && w.t.s.response == modePrevent {
-		// Hold the headers until the body is inspected, so that a
-		// blocked response can still become a 403.
-		return
-	}
 	if !w.committed {
+		// The handler streams: inspect what it wrote so far and send it
+		// now instead of holding the response back until it ends.
 		if w.status == 0 {
 			w.status = http.StatusOK
 		}
-		if !w.commit(nil, false) {
+		data := w.buf
+		w.buf = nil
+		if !w.commit(data, false) {
 			return
+		}
+		if len(data) > 0 {
+			if _, err := w.ResponseWriter.Write(data); err != nil {
+				return
+			}
 		}
 	}
 	if f, ok := w.ResponseWriter.(http.Flusher); ok {
@@ -567,6 +592,8 @@ func (t *handler) verdict(ctx context.Context, conn Conn, m mode, dir Dir, data 
 	ctx, cancel := context.WithTimeout(ctx, t.s.timeout)
 	defer cancel()
 	if m == modeDetect {
+		// Payload that could not be sent in time is reported to the
+		// engine as a gap by the transport; detect mode never blocks.
 		_ = conn.Send(ctx, dir, data)
 		return false, nil
 	}

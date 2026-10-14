@@ -183,3 +183,53 @@ func TestFailPolicy(t *testing.T) {
 		t.Fatal("invalid mode accepted")
 	}
 }
+
+// In response prevent mode a handler that flushes (event stream) gets each
+// flushed part inspected and delivered right away; a dropped part aborts
+// the response.
+func TestPreventStreamsFlushedResponses(t *testing.T) {
+	dir := startMockd(t)
+	release := make(chan struct{})
+	events := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		if r.URL.Path == "/leak" {
+			_, _ = io.WriteString(w, "data: "+marker+"\n\n")
+			w.(http.Flusher).Flush()
+		}
+		_, _ = io.WriteString(w, "data: last\n\n")
+	})
+	srv := newServer(t, newTap(t, Config{SocketDir: dir, Response: "prevent", Timeout: "2s", Name: "events"}, events), nil)
+	for _, path := range []string{"/ok", "/leak"} {
+		resp, err := srv.Client().Get(srv.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := make([]byte, len("data: first\n\n"))
+		got := make(chan error, 1)
+		go func() { _, err := io.ReadFull(resp.Body, first); got <- err }()
+		select {
+		case err := <-got:
+			if err != nil || string(first) != "data: first\n\n" {
+				t.Fatalf("%s: first event %q %v", path, first, err)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("%s: flushed event held back", path)
+		}
+		release <- struct{}{}
+		rest, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if path == "/ok" && (err != nil || string(rest) != "data: last\n\n") {
+			t.Fatalf("rest %q %v", rest, err)
+		}
+		if path == "/leak" && (err == nil || strings.Contains(string(rest), marker)) {
+			t.Fatalf("dropped event delivered: %q %v", rest, err)
+		}
+	}
+}
