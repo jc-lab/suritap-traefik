@@ -1,0 +1,12 @@
+displayName: suritap
+type: middleware
+import: github.com/jc-lab/suricontroller/adapters/traefik-plugin
+basePkg: suritap
+summary: Inspect decrypted HTTP traffic with Suricata through the suritap socket transport; blocks requests (and optionally responses) on drop verdicts.
+
+testData:
+  socketDir: /run/suritap
+  mode: prevent
+  response: detect
+  failPolicy: open
+  timeout: 100ms
