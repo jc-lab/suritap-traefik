@@ -2,6 +2,7 @@ package suritap
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -84,10 +85,10 @@ type Transport interface {
 type Conn interface {
 	CID() uint64
 	// Send streams payload without waiting (detect).
-	Send(deadline time.Time, dir Dir, data []byte) error
-	// Inspect sends payload and waits until deadline for the verdict
-	// covering everything sent so far in dir.
-	Inspect(deadline time.Time, dir Dir, data []byte) (Verdict, error)
+	Send(ctx context.Context, dir Dir, data []byte) error
+	// Inspect sends payload and waits for the verdict covering everything
+	// sent so far in dir, until ctx is done.
+	Inspect(ctx context.Context, dir Dir, data []byte) (Verdict, error)
 	Close(reset bool) error
 }
 
@@ -538,14 +539,20 @@ func (c *streamConn) sendChunks(deadline time.Time, dir Dir, data []byte) error 
 	return nil
 }
 
-func (c *streamConn) Send(deadline time.Time, dir Dir, data []byte) error {
-	return c.sendChunks(deadline, dir, data)
+// writeDeadline bounds socket writes made on behalf of ctx.
+func writeDeadline(ctx context.Context) time.Time {
+	if d, ok := ctx.Deadline(); ok {
+		return d
+	}
+	return time.Now().Add(2 * time.Second)
 }
 
-// errTimeout is returned when no verdict arrived before the deadline.
-var errTimeout = errors.New("suritap: verdict timeout")
+func (c *streamConn) Send(ctx context.Context, dir Dir, data []byte) error {
+	return c.sendChunks(writeDeadline(ctx), dir, data)
+}
 
-func (c *streamConn) Inspect(deadline time.Time, dir Dir, data []byte) (Verdict, error) {
+func (c *streamConn) Inspect(ctx context.Context, dir Dir, data []byte) (Verdict, error) {
+	deadline := writeDeadline(ctx)
 	split := 0
 	if len(data) > 0 {
 		split = (len(data) - 1) / c.s.maxPayload * c.s.maxPayload
@@ -566,15 +573,16 @@ func (c *streamConn) Inspect(deadline time.Time, dir Dir, data []byte) (Verdict,
 		c.s.take(token)
 		return Verdict{}, err
 	}
-	timer := time.AfterFunc(time.Until(deadline), func() { ch <- []byte{} })
+	// No select (see streamSession): cancellation posts a marker instead.
+	stop := context.AfterFunc(ctx, func() { ch <- []byte{} })
 	body := <-ch
-	timer.Stop()
+	stop()
 	switch {
 	case body == nil:
 		return Verdict{}, ErrUnavailable
 	case len(body) == 0:
 		if c.s.abandon(token) {
-			return Verdict{}, errTimeout
+			return Verdict{}, ctx.Err()
 		}
 		// The verdict (or failure) raced the timer and is queued.
 		if body = <-ch; body == nil {

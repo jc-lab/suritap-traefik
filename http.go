@@ -3,6 +3,7 @@ package suritap
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -68,7 +69,7 @@ func (t *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	blocked, v := t.inspectRequest(r, conn, st)
 	if blocked {
 		logBlock(t.s.endpoint, conn.CID(), "request", v)
-		writeBlocked(w, conn.CID())
+		writeBlocked(w, conn.CID(), isDrop(v))
 		return
 	}
 	if upgrade || t.s.response == modeOff {
@@ -84,11 +85,19 @@ func (t *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // reqState is shared by the request body reader and the response writer.
 type reqState struct {
-	blocked int32 // set when a streamed request body was blocked
+	blocked int32 // set when a streamed request body was blocked: 1 drop, 2 no verdict
 }
 
 func (st *reqState) isBlocked() bool { return atomic.LoadInt32(&st.blocked) != 0 }
-func (st *reqState) block()          { atomic.StoreInt32(&st.blocked, 1) }
+func (st *reqState) isDrop() bool    { return atomic.LoadInt32(&st.blocked) == 1 }
+
+func (st *reqState) block(v *Verdict) {
+	if isDrop(v) {
+		atomic.StoreInt32(&st.blocked, 1)
+	} else {
+		atomic.StoreInt32(&st.blocked, 2)
+	}
+}
 
 func parseAddr(s string) (Addr, bool) {
 	host, port, err := net.SplitHostPort(s)
@@ -146,9 +155,13 @@ func headerHasToken(h http.Header, name, token string) bool {
 	return false
 }
 
-// writeBlocked answers 403. Headers already set for the response (by the
-// upstream, e.g. Set-Cookie) are discarded.
-func writeBlocked(w http.ResponseWriter, cid uint64) {
+// isDrop tells a drop verdict from a refusal without one (fail closed).
+func isDrop(v *Verdict) bool { return v != nil && v.Action == Drop }
+
+// writeBlocked answers 403 for drop verdicts and 503 when the request was
+// refused without one (fail closed). Headers already set for the response
+// (by the upstream, e.g. Set-Cookie) are discarded.
+func writeBlocked(w http.ResponseWriter, cid uint64, drop bool) {
 	h := w.Header()
 	keys := make([]string, 0, len(h))
 	for k := range h {
@@ -160,6 +173,11 @@ func writeBlocked(w http.ResponseWriter, cid uint64) {
 	h.Set("Content-Type", "text/plain; charset=utf-8")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("X-Suritap-Cid", strconv.FormatUint(cid, 10))
+	if !drop {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "Service Unavailable\n")
+		return
+	}
 	w.WriteHeader(http.StatusForbidden)
 	_, _ = io.WriteString(w, "Forbidden\n")
 }
@@ -170,7 +188,7 @@ func writeBlocked(w http.ResponseWriter, cid uint64) {
 func (t *handler) inspectRequest(r *http.Request, conn Conn, st *reqState) (bool, *Verdict) {
 	hasBody := r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0
 	if !hasBody {
-		return t.verdict(conn, t.s.mode, ToServer, requestHead(r, 0))
+		return t.verdict(r.Context(), conn, t.s.mode, ToServer, requestHead(r, 0))
 	}
 	var prefix []byte
 	if r.ContentLength < 0 || r.ContentLength <= t.s.maxBody {
@@ -179,7 +197,7 @@ func (t *handler) inspectRequest(r *http.Request, conn Conn, st *reqState) (bool
 			// Truncated client upload: let the upstream see the same
 			// failure, after inspecting what arrived.
 			r.Body = &errReader{data: data, err: err}
-			blocked, v := t.verdict(conn, t.s.mode, ToServer, append(requestHead(r, int64(len(data))), data...))
+			blocked, v := t.verdict(r.Context(), conn, t.s.mode, ToServer, append(requestHead(r, int64(len(data))), data...))
 			return blocked, v
 		}
 		if int64(len(data)) <= t.s.maxBody {
@@ -187,7 +205,7 @@ func (t *handler) inspectRequest(r *http.Request, conn Conn, st *reqState) (bool
 			r.Body = io.NopCloser(bytes.NewReader(data))
 			r.ContentLength = int64(len(data))
 			r.TransferEncoding = nil
-			return t.verdict(conn, t.s.mode, ToServer, append(requestHead(r, r.ContentLength), data...))
+			return t.verdict(r.Context(), conn, t.s.mode, ToServer, append(requestHead(r, r.ContentLength), data...))
 		}
 		prefix = data
 	}
@@ -199,10 +217,10 @@ func (t *handler) inspectRequest(r *http.Request, conn Conn, st *reqState) (bool
 	} else {
 		head = append(head, prefix...)
 	}
-	if blocked, v := t.verdict(conn, t.s.mode, ToServer, head); blocked {
+	if blocked, v := t.verdict(r.Context(), conn, t.s.mode, ToServer, head); blocked {
 		return true, v
 	}
-	r.Body = &inspectBody{t: t, conn: conn, st: st, prefix: bytes.NewReader(prefix), body: r.Body, chunked: chunked}
+	r.Body = &inspectBody{t: t, conn: conn, ctx: r.Context(), st: st, prefix: bytes.NewReader(prefix), body: r.Body, chunked: chunked}
 	return false, nil
 }
 
@@ -227,6 +245,7 @@ func (e *errReader) Close() error { return nil }
 type inspectBody struct {
 	t       *handler
 	conn    Conn
+	ctx     context.Context // the request's; Read has no ctx parameter
 	st      *reqState
 	prefix  *bytes.Reader // already inspected
 	body    io.ReadCloser
@@ -247,16 +266,16 @@ func (b *inspectBody) Read(p []byte) (int, error) {
 		if b.chunked {
 			data = chunk(data)
 		}
-		if blocked, v := b.t.verdict(b.conn, b.t.s.mode, ToServer, data); blocked {
-			b.st.block()
+		if blocked, v := b.t.verdict(b.ctx, b.conn, b.t.s.mode, ToServer, data); blocked {
+			b.st.block(v)
 			logBlock(b.t.s.endpoint, b.conn.CID(), "request body", v)
 			return 0, errBlocked
 		}
 	}
 	if err == io.EOF && b.chunked && !b.done {
 		b.done = true
-		if blocked, v := b.t.verdict(b.conn, b.t.s.mode, ToServer, []byte("0\r\n\r\n")); blocked {
-			b.st.block()
+		if blocked, v := b.t.verdict(b.ctx, b.conn, b.t.s.mode, ToServer, []byte("0\r\n\r\n")); blocked {
+			b.st.block(v)
 			logBlock(b.t.s.endpoint, b.conn.CID(), "request body", v)
 			return n, errBlocked
 		}
@@ -299,10 +318,10 @@ func (w *respWriter) WriteHeader(code int) {
 		return
 	}
 	if w.st.isBlocked() {
-		// The request body was blocked while streaming: answer 403
-		// instead of the upstream error.
+		// The request body was blocked while streaming: answer 403 (or
+		// 503) instead of the upstream error.
 		w.aborted = true
-		writeBlocked(w.ResponseWriter, w.conn.CID())
+		writeBlocked(w.ResponseWriter, w.conn.CID(), w.st.isDrop())
 		return
 	}
 	if w.status == 0 {
@@ -349,10 +368,10 @@ func (w *respWriter) commit(body []byte, final bool) bool {
 			w.endSent = true
 		}
 	}
-	if blocked, v := w.t.verdict(w.conn, w.t.s.response, ToClient, data); blocked {
+	if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.t.s.response, ToClient, data); blocked {
 		logBlock(w.t.s.endpoint, w.conn.CID(), "response", v)
 		w.aborted = true
-		writeBlocked(w.ResponseWriter, w.conn.CID())
+		writeBlocked(w.ResponseWriter, w.conn.CID(), isDrop(v))
 		return false
 	}
 	w.committed = true
@@ -400,7 +419,7 @@ func (w *respWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	if len(p) > 0 && !w.noBody {
-		if blocked, v := w.t.verdict(w.conn, w.t.s.response, ToClient, w.frame(p)); blocked {
+		if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.t.s.response, ToClient, w.frame(p)); blocked {
 			logBlock(w.t.s.endpoint, w.conn.CID(), "response", v)
 			w.aborted = true
 			// Headers are gone already: abort the connection.
@@ -454,7 +473,7 @@ func (w *respWriter) finish() {
 		return
 	}
 	if w.chunked && !w.noBody && !w.endSent {
-		if blocked, v := w.t.verdict(w.conn, w.t.s.response, ToClient, []byte("0\r\n\r\n")); blocked {
+		if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.t.s.response, ToClient, []byte("0\r\n\r\n")); blocked {
 			logBlock(w.t.s.endpoint, w.conn.CID(), "response end", v)
 			// The body is out already; abort so the client sees a
 			// truncated response instead of a complete one.
@@ -541,16 +560,17 @@ func chunk(p []byte) []byte {
 
 // verdict sends data and reports whether the traffic must be blocked. In
 // detect mode it never waits.
-func (t *handler) verdict(conn Conn, m mode, dir Dir, data []byte) (bool, *Verdict) {
+func (t *handler) verdict(ctx context.Context, conn Conn, m mode, dir Dir, data []byte) (bool, *Verdict) {
 	if m == modeOff {
 		return false, nil
 	}
-	deadline := time.Now().Add(t.s.timeout)
+	ctx, cancel := context.WithTimeout(ctx, t.s.timeout)
+	defer cancel()
 	if m == modeDetect {
-		_ = conn.Send(deadline, dir, data)
+		_ = conn.Send(ctx, dir, data)
 		return false, nil
 	}
-	v, err := conn.Inspect(deadline, dir, data)
+	v, err := conn.Inspect(ctx, dir, data)
 	switch {
 	case err != nil:
 		Logf(false, "no verdict for cid %d (%s): %v", conn.CID(), t.s.endpoint, err)
