@@ -1,0 +1,22 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: test -z "$(gofmt -l .)"
+      - run: go vet ./...
+      # Tests that need suritap-mockd (from jc-lab/suricontroller) are
+      # skipped here; suricontroller runs them with the plugin as a
+      # submodule, together with a Yaegi harness and a Traefik end-to-end
+      # test.
+      - run: go test -race ./...

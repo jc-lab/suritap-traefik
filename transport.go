@@ -109,7 +109,7 @@ type Conn interface {
 // ErrUnavailable is returned while Suricata cannot be reached.
 var ErrUnavailable = errors.New("suritap: Suricata unavailable")
 
-// Wire protocol (see docs/suritap.md): 64-byte HELLO/WELCOME, then frames
+// Wire protocol (see docs/suritap.md in github.com/jc-lab/suricontroller): 64-byte HELLO/WELCOME, then frames
 // "len:u32 kind:u16 flags:u16 body", little-endian.
 const (
 	protoMagic     = 0x50415453

@@ -1,3 +1,3 @@
-module github.com/jc-lab/suricontroller/adapters/traefik-plugin
+module github.com/jc-lab/suritap-traefik
 
 go 1.22

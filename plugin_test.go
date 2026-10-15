@@ -22,6 +22,9 @@ const marker = "SURITAP-TEST-DROP" // suritap-mockd drops packets containing it
 
 func startMockd(t *testing.T, extra ...string) string {
 	t.Helper()
+	// suritap-mockd comes from jc-lab/suricontroller (tap/); as a submodule
+	// of it (adapters/traefik-plugin) the build there is found, otherwise
+	// set SURITAP_MOCKD or the tests that need it are skipped.
 	bin := os.Getenv("SURITAP_MOCKD")
 	if bin == "" {
 		_, file, _, _ := runtime.Caller(0)
