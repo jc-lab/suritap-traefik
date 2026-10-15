@@ -51,12 +51,39 @@ func (t *handler) open(r *http.Request) (Conn, error) {
 	return t.tr.Open(ctx, src, dst, meta)
 }
 
+// modes returns the request and response modes of this request: the
+// operator's endpoint policy when it lists the endpoint, else the
+// middleware's settings. Detect never blocks, so it also turns response
+// prevent into detect.
+func (t *handler) modes() (mode, mode) {
+	req, resp := t.s.mode, t.s.response
+	if m, ok := t.tr.EndpointMode(t.s.endpoint); ok {
+		switch m {
+		case ModeOff:
+			return modeOff, modeOff
+		case ModeDetect:
+			req = modeDetect
+			if resp == modePrevent {
+				resp = modeDetect
+			}
+		case ModePrevent:
+			req = modePrevent
+		}
+	}
+	return req, resp
+}
+
 func (t *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	next := t.next
+	reqMode, respMode := t.modes()
+	if reqMode == modeOff {
+		next.ServeHTTP(w, r)
+		return
+	}
 	conn, err := t.open(r)
 	if err != nil {
 		logUnavailable(t.s.endpoint, err)
-		if t.s.failClosed && t.s.mode == modePrevent {
+		if t.s.failClosed && reqMode == modePrevent {
 			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 			return
 		}
@@ -66,14 +93,14 @@ func (t *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	defer conn.Close(false)
 
 	upgrade := r.Header.Get("Upgrade") != "" && headerHasToken(r.Header, "Connection", "upgrade")
-	st := &reqState{}
+	st := &reqState{mode: reqMode, response: respMode}
 	blocked, v := t.inspectRequest(r, conn, st)
 	if blocked {
 		logBlock(t.s.endpoint, conn.CID(), "request", v)
 		writeBlocked(w, conn.CID(), isDrop(v))
 		return
 	}
-	if upgrade || t.s.response == modeOff {
+	if upgrade || respMode == modeOff {
 		// Upgraded connections (websocket) are only inspected up to the
 		// handshake; the response writer is passed through untouched.
 		next.ServeHTTP(w, r)
@@ -88,6 +115,9 @@ func (t *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // transport's goroutine) and the response writer. A mutex rather than
 // sync/atomic: Yaegi crashes on atomics on fields used across goroutines.
 type reqState struct {
+	// Effective modes of this request (set before the request is shared).
+	mode, response mode
+
 	mu      sync.Mutex
 	blocked int // set when a streamed request body was blocked: 1 drop, 2 no verdict
 }
@@ -208,7 +238,7 @@ func writeBlocked(w http.ResponseWriter, cid uint64, drop bool) {
 func (t *handler) inspectRequest(r *http.Request, conn Conn, st *reqState) (bool, *Verdict) {
 	hasBody := r.Body != nil && r.Body != http.NoBody && r.ContentLength != 0
 	if !hasBody {
-		return t.verdict(r.Context(), conn, t.s.mode, ToServer, requestHead(r, 0))
+		return t.verdict(r.Context(), conn, st.mode, ToServer, requestHead(r, 0))
 	}
 	var prefix []byte
 	if r.ContentLength < 0 || r.ContentLength <= t.s.maxBody {
@@ -217,7 +247,7 @@ func (t *handler) inspectRequest(r *http.Request, conn Conn, st *reqState) (bool
 			// Truncated client upload: let the upstream see the same
 			// failure, after inspecting what arrived.
 			r.Body = &errReader{data: data, err: err}
-			blocked, v := t.verdict(r.Context(), conn, t.s.mode, ToServer, append(requestHead(r, int64(len(data))), data...))
+			blocked, v := t.verdict(r.Context(), conn, st.mode, ToServer, append(requestHead(r, int64(len(data))), data...))
 			return blocked, v
 		}
 		if int64(len(data)) <= t.s.maxBody {
@@ -225,7 +255,7 @@ func (t *handler) inspectRequest(r *http.Request, conn Conn, st *reqState) (bool
 			r.Body = io.NopCloser(bytes.NewReader(data))
 			r.ContentLength = int64(len(data))
 			r.TransferEncoding = nil
-			return t.verdict(r.Context(), conn, t.s.mode, ToServer, append(requestHead(r, r.ContentLength), data...))
+			return t.verdict(r.Context(), conn, st.mode, ToServer, append(requestHead(r, r.ContentLength), data...))
 		}
 		prefix = data
 	}
@@ -237,7 +267,7 @@ func (t *handler) inspectRequest(r *http.Request, conn Conn, st *reqState) (bool
 	} else {
 		head = append(head, prefix...)
 	}
-	if blocked, v := t.verdict(r.Context(), conn, t.s.mode, ToServer, head); blocked {
+	if blocked, v := t.verdict(r.Context(), conn, st.mode, ToServer, head); blocked {
 		return true, v
 	}
 	r.Body = &inspectBody{t: t, conn: conn, ctx: r.Context(), st: st, prefix: bytes.NewReader(prefix), body: r.Body, chunked: chunked}
@@ -286,7 +316,7 @@ func (b *inspectBody) Read(p []byte) (int, error) {
 		if b.chunked {
 			data = chunk(data)
 		}
-		if blocked, v := b.t.verdict(b.ctx, b.conn, b.t.s.mode, ToServer, data); blocked {
+		if blocked, v := b.t.verdict(b.ctx, b.conn, b.st.mode, ToServer, data); blocked {
 			b.st.block(v)
 			logBlock(b.t.s.endpoint, b.conn.CID(), "request body", v)
 			return 0, errBlocked
@@ -294,7 +324,7 @@ func (b *inspectBody) Read(p []byte) (int, error) {
 	}
 	if err == io.EOF && b.chunked && !b.done {
 		b.done = true
-		if blocked, v := b.t.verdict(b.ctx, b.conn, b.t.s.mode, ToServer, []byte("0\r\n\r\n")); blocked {
+		if blocked, v := b.t.verdict(b.ctx, b.conn, b.st.mode, ToServer, []byte("0\r\n\r\n")); blocked {
 			b.st.block(v)
 			logBlock(b.t.s.endpoint, b.conn.CID(), "request body", v)
 			return n, errBlocked
@@ -348,7 +378,7 @@ func (w *respWriter) WriteHeader(code int) {
 	if w.status == 0 {
 		w.status = code
 	}
-	if w.t.s.response != modePrevent {
+	if w.st.response != modePrevent {
 		w.commit(nil, false)
 	}
 }
@@ -389,7 +419,7 @@ func (w *respWriter) commit(body []byte, final bool) bool {
 			w.endSent = true
 		}
 	}
-	if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.t.s.response, ToClient, data); blocked {
+	if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.st.response, ToClient, data); blocked {
 		logBlock(w.t.s.endpoint, w.conn.CID(), "response", v)
 		w.aborted = true
 		writeBlocked(w.ResponseWriter, w.conn.CID(), isDrop(v))
@@ -419,7 +449,7 @@ func (w *respWriter) Write(p []byte) (int, error) {
 		if w.status == 0 {
 			w.status = http.StatusOK
 		}
-		if w.t.s.response != modePrevent {
+		if w.st.response != modePrevent {
 			if !w.commit(p, false) {
 				return 0, errBlocked
 			}
@@ -440,7 +470,7 @@ func (w *respWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	}
 	if len(p) > 0 && !w.noBody {
-		if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.t.s.response, ToClient, w.frame(p)); blocked {
+		if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.st.response, ToClient, w.frame(p)); blocked {
 			logBlock(w.t.s.endpoint, w.conn.CID(), "response", v)
 			w.aborted = true
 			// Headers are gone already: abort the connection.
@@ -498,7 +528,7 @@ func (w *respWriter) finish() {
 		return
 	}
 	if w.chunked && !w.noBody && !w.endSent {
-		if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.t.s.response, ToClient, []byte("0\r\n\r\n")); blocked {
+		if blocked, v := w.t.verdict(w.r.Context(), w.conn, w.st.response, ToClient, []byte("0\r\n\r\n")); blocked {
 			logBlock(w.t.s.endpoint, w.conn.CID(), "response end", v)
 			// The body is out already; abort so the client sees a
 			// truncated response instead of a complete one.

@@ -78,8 +78,22 @@ func (v Verdict) ReasonString() string {
 type Transport interface {
 	// Open announces a connection; ctx bounds waiting for Suricata.
 	Open(ctx context.Context, src, dst Addr, meta []Meta) (Conn, error)
+	// EndpointMode returns the operator's mode for an endpoint from the
+	// plugin's endpoint policy; false when the policy does not list it (or
+	// none was received yet), and the middleware's own setting applies.
+	EndpointMode(endpoint string) (EndpointMode, bool)
 	Close() error
 }
+
+// EndpointMode is an endpoint's inspection mode set by the operator
+// (suri-controller → suri-node-agent → suritap plugin → clients).
+type EndpointMode uint8
+
+const (
+	ModeOff     EndpointMode = 1 // not inspected
+	ModeDetect  EndpointMode = 2 // inspected without waiting; never blocked
+	ModePrevent EndpointMode = 3 // drop verdicts block
+)
 
 // Conn is one inspected connection (one HTTP request for the HTTP tap).
 type Conn interface {
@@ -108,6 +122,7 @@ const (
 	kClose         = 5
 	kVerdict       = 0x81
 	kPong          = 0x83
+	kPolicy        = 0x85
 	fWantVerdict   = 1
 	openFixed      = 56
 	dataFixed      = 16
@@ -155,6 +170,10 @@ type StreamTransport struct {
 	retryAt  time.Time
 	nextCID  uint64
 	closed   bool
+	// policy is the last endpoint policy received (kept across
+	// reconnects); replaced, never modified. Compiled value type only (see
+	// streamSession).
+	policy map[string]uint8
 	// Requests waiting for a session being opened. Woken (one value each,
 	// buffered) whenever an attempt ends; plain channels and
 	// context.AfterFunc instead of select, see streamSession.
@@ -229,7 +248,7 @@ func (t *StreamTransport) session(ctx context.Context) (uint64, *streamSession, 
 	layout = t.layout
 	t.mu.Unlock()
 
-	s, err := dialStream(streamPath(t.dir, idx), t.name)
+	s, err := dialStream(streamPath(t.dir, idx), t.name, t)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -301,6 +320,63 @@ func (t *StreamTransport) Open(ctx context.Context, src, dst Addr, meta []Meta) 
 	return &streamConn{s: s, cid: cid}, nil
 }
 
+func (t *StreamTransport) setPolicy(p map[string]uint8) {
+	t.mu.Lock()
+	t.policy = p
+	t.mu.Unlock()
+}
+
+// EndpointMode implements Transport. Without a live session it opens one in
+// the background, so that policy changes keep arriving even when every
+// request is skipped (endpoint off).
+func (t *StreamTransport) EndpointMode(endpoint string) (EndpointMode, bool) {
+	t.mu.Lock()
+	m, ok := t.policy[endpoint]
+	live := false
+	for i := 0; i < len(t.sessions); i++ {
+		if t.sessions[i] != nil && !t.sessions[i].isDead() {
+			live = true
+			break
+		}
+	}
+	probe := !live && !t.closed && !t.probing && time.Now().After(t.retryAt)
+	t.mu.Unlock()
+	if probe {
+		go t.probe()
+	}
+	return EndpointMode(m), ok
+}
+
+func (t *StreamTransport) probe() {
+	ctx, cancel := context.WithTimeout(context.Background(), dialTimeout)
+	defer cancel()
+	_, _, _ = t.session(ctx)
+}
+
+// decodePolicy parses a POLICY body: version:u32 count:u16 rsv:u16, then
+// per endpoint mode:u8 len:u8 name[len].
+func decodePolicy(b []byte) (map[string]uint8, bool) {
+	if len(b) < 8 {
+		return nil, false
+	}
+	n := int(binary.LittleEndian.Uint16(b[4:]))
+	p := make(map[string]uint8, n)
+	off := 8
+	for i := 0; i < n; i++ {
+		if off+2 > len(b) {
+			return nil, false
+		}
+		m, l := b[off], int(b[off+1])
+		off += 2
+		if off+l > len(b) || m < uint8(ModeOff) || m > uint8(ModePrevent) {
+			return nil, false
+		}
+		p[string(b[off:off+l])] = m
+		off += l
+	}
+	return p, true
+}
+
 // Close closes all sessions; the transport cannot be used afterwards.
 func (t *StreamTransport) Close() error {
 	t.mu.Lock()
@@ -319,6 +395,7 @@ func (t *StreamTransport) Close() error {
 }
 
 type streamSession struct {
+	owner      *StreamTransport // receives POLICY records
 	conn       net.Conn
 	worker     int
 	workers    int
@@ -347,7 +424,7 @@ type streamSession struct {
 	dead        bool
 }
 
-func dialStream(path, name string) (*streamSession, error) {
+func dialStream(path, name string, owner *StreamTransport) (*streamSession, error) {
 	c, err := net.DialTimeout("unix", path, dialTimeout)
 	if err != nil {
 		return nil, fmt.Errorf("suritap: %v", err)
@@ -387,6 +464,7 @@ func dialStream(path, name string) (*streamSession, error) {
 	}
 	now := time.Now()
 	s := &streamSession{
+		owner:       owner,
 		conn:        c,
 		worker:      int(binary.LittleEndian.Uint16(w[8:])),
 		workers:     int(binary.LittleEndian.Uint16(w[10:])),
@@ -572,6 +650,10 @@ func (s *streamSession) readLoop() {
 		case kPong:
 			if len(body) >= 4 {
 				s.complete(binary.LittleEndian.Uint32(body), body)
+			}
+		case kPolicy:
+			if p, ok := decodePolicy(body); ok && s.owner != nil {
+				s.owner.setPolicy(p)
 			}
 		}
 	}

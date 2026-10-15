@@ -20,7 +20,7 @@ import (
 
 const marker = "SURITAP-TEST-DROP" // suritap-mockd drops packets containing it
 
-func startMockd(t *testing.T) string {
+func startMockd(t *testing.T, extra ...string) string {
 	t.Helper()
 	bin := os.Getenv("SURITAP_MOCKD")
 	if bin == "" {
@@ -40,7 +40,7 @@ func startMockd(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cmd := exec.Command(bin, "--dir", dir, "--workers", "2", "--max-segment", "4096")
+	cmd := exec.Command(bin, append([]string{"--dir", dir, "--workers", "2", "--max-segment", "4096"}, extra...)...)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -231,5 +231,56 @@ func TestPreventStreamsFlushedResponses(t *testing.T) {
 		if path == "/leak" && (err == nil || strings.Contains(string(rest), marker)) {
 			t.Fatalf("dropped event delivered: %q %v", rest, err)
 		}
+	}
+}
+
+// The operator's endpoint policy (pushed by the plugin) overrides the
+// middleware's mode: off skips inspection, detect never blocks, prevent
+// blocks even when the middleware says detect; unlisted endpoints keep the
+// middleware's setting.
+func TestEndpointPolicy(t *testing.T) {
+	pf := filepath.Join(t.TempDir(), "policy")
+	write := func(text string) {
+		if err := os.WriteFile(pf, []byte(text), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("ep-off off\nep-detect detect\nep-prevent prevent\n")
+	dir := startMockd(t, "--policy-file", pf)
+	b := &backend{reply: "hello"}
+	srv := func(endpoint, mode string) *httptest.Server {
+		return newServer(t, newTap(t, Config{SocketDir: dir, Endpoint: endpoint, Mode: mode, Timeout: "2s", Name: "policy-" + endpoint}, b), b)
+	}
+	off, detect, prevent, unlisted := srv("ep-off", "prevent"), srv("ep-detect", "prevent"), srv("ep-prevent", "detect"), srv("ep-other", "prevent")
+	get := func(s *httptest.Server) int {
+		resp, _ := do(t, s.Client(), "GET", s.URL+"/"+marker, nil)
+		return resp.StatusCode
+	}
+	// The policy arrives with the first session; until then the
+	// middleware's own mode applies.
+	for i := 0; ; i++ {
+		if get(prevent) == 403 && get(detect) == 200 {
+			break
+		}
+		if i == 100 {
+			t.Fatal("policy not applied")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c := get(off); c != 200 {
+		t.Fatalf("off endpoint: %d", c)
+	}
+	if c := get(unlisted); c != 403 {
+		t.Fatalf("unlisted endpoint keeps the middleware mode: %d", c)
+	}
+	write("ep-off prevent\n")
+	for i := 0; get(off) != 403; i++ {
+		if i == 300 {
+			t.Fatal("policy change not applied")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c := get(prevent); c != 200 {
+		t.Fatalf("endpoint dropped from the policy falls back to the middleware's detect: %d", c)
 	}
 }
